@@ -1,0 +1,5 @@
+# Build artifacts
+/target
+
+# MNIST dataset (64MB binary files - download separately)
+data/
