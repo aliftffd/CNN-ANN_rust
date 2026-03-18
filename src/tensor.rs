@@ -31,6 +31,10 @@ pub enum Op {
         h: usize,
         w: usize,
     },
+    Softmax {
+        input: usize,
+        cols: usize,
+    },
 }
 
 pub struct Tensor {
@@ -148,7 +152,7 @@ impl Tape {
         // debug
         assert_eq!(
             tensor_a.shape, tensor_b.shape,
-            "Shape must match for element-wise mul"
+            "Shape must match for element-wise add"
         );
 
         let result_data: Vec<f64> = tensor_a
@@ -352,7 +356,7 @@ impl Tape {
         // compute output spatioal dimensions (with no padding and stride = 1.0)
         let out_h = in_h - kernel_h + 1;
         let out_w = in_w - kernel_w + 1;
-        assert!(out_h > 0 && out_w > 0, "Kernel too loarge for input");
+        assert!(out_h > 0 && out_w > 0, "Kernel too large for input");
 
         // get data slices from the stored tensor
         let input_data = &self.tensors[input_idx].data;
@@ -494,6 +498,62 @@ impl Tape {
                 channels,
                 h,
                 w,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn softmax(&mut self, input_idx: usize, cols: usize) -> usize {
+        // get input data
+        let input_data = &self.tensors[input_idx].data;
+        let total_len = input_data.len();
+
+        let rows = total_len / cols;
+        assert_eq!(rows * cols, total_len, "Input length must be multiple cols");
+
+        // prepare output buffer
+        let mut output_data = vec![0.0; total_len];
+
+        for r in 0..rows {
+            let row_start = r * cols;
+            let row = &input_data[row_start..row_start + cols];
+
+            let mut max_val = row[0];
+            for &x in row.iter().skip(1) {
+                if x > max_val {
+                    max_val = x;
+                }
+            }
+
+            let mut sum = 0.0;
+            let mut exps = vec![0.0; cols];
+            for (i, &x) in row.iter().enumerate() {
+                let e = (x - max_val).exp();
+                exps[i] = e;
+                sum += e;
+            }
+
+            for i in 0..cols {
+                output_data[row_start + i] = exps[i] / sum;
+            }
+        }
+
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; total_len]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: output_data,
+            shape: self.tensors[input_idx].shape.clone(),
+            grad,
+            requires_grad,
+            op: Op::Softmax {
+                input: input_idx,
+                cols,
             },
         };
         self.tensors.push(result_tensor);
@@ -789,6 +849,37 @@ impl Tape {
                         }
                     }
                 }
+                Op::Softmax { input, cols } => {
+                    let total_len = _data_current.len();
+                    let rows = total_len / cols;
+
+                    if self.tensors[input].requires_grad {
+                        let mut input_grad = vec![0.0; total_len];
+
+                        for r in 0..rows {
+                            let start = r * cols;
+                            let end = start + cols;
+
+                            let s_row = &_data_current[start..end];
+                            let grad_row = &grad_current[start..end];
+
+                            let mut dot = 0.0;
+                            for j in 0..cols {
+                                dot += grad_row[j] * s_row[j];
+                            }
+
+                            for j in 0..cols {
+                                input_grad[start + j] = s_row[j] * (grad_row[j] - dot);
+                            }
+                        }
+
+                        for (idx, g) in input_grad.into_iter().enumerate() {
+                            self.tensors[input].grad[idx] += g;
+                        }
+                    }
+                }
+
+
             }
         }
     }
