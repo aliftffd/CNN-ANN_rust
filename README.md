@@ -1,12 +1,12 @@
 # rust_ann
 
-A from-scratch deep learning framework in pure Rust — **zero external dependencies**. Implements both a fully connected ANN and a CNN with automatic differentiation, trained and compared on MNIST handwritten digits.
+A from-scratch deep learning framework in pure Rust — **zero external dependencies**. Implements an ANN, CNN, Transformer, and Vision Transformer with automatic differentiation, all built on a single tape-based autograd engine.
 
 ## Why
 
-Most ML frameworks are Python + C++. This project proves you can build a working autograd engine, convolutional layers, pooling, and SGD training loop in pure Rust with nothing but `std`. It provides a fair head-to-head comparison between a simple ANN and a CNN on the same dataset under identical conditions.
+Most ML frameworks are Python + C++. This project proves you can build a working autograd engine, convolutional layers, multi-head attention, layer normalization, and full training loops in pure Rust with nothing but `std`. It provides a head-to-head comparison across four architectures on the same training infrastructure.
 
-## Architecture
+## Architectures
 
 ### ANN (Artificial Neural Network)
 ```
@@ -26,15 +26,46 @@ Input(1x28x28) -> Conv2D(1->8, 3x3) -> ReLU -> MaxPool(2x2)
 - Single-image processing (no batching)
 - Preserves spatial structure of images
 
-### Autograd Engine (`tensor.rs`)
-- Tape-based reverse-mode automatic differentiation
-- Supports: MatMul, Conv2D, MaxPool2D, ReLU, MSE, Broadcast Add, Flatten
-- SGD optimizer with per-parameter gradient tracking
-- Kaiming/He weight initialization (xorshift RNG, seed=42)
+### Transformer (Character Prediction)
+```
+Embedding(6, 32) -> +PosEnc -> TransformerBlock x2 -> Linear(32->6) -> Softmax + CrossEntropy
+```
+Each TransformerBlock:
+```
+MultiHeadAttention(4 heads) -> Residual + LayerNorm -> FFN(32->64->32) -> Residual + LayerNorm
+```
+- **d_model=32, n_heads=4, d_ff=64, 2 layers**
+- Trained on next-character prediction over a repeating `abcdef` pattern
+- Autoregressive generation after training
 
-## Fair Comparison Results
+### Vision Transformer (ViT)
+```
+Image[28,28] -> Linear(28->32) -> +PosEnc -> TransformerBlock x2 -> MeanPool -> Linear(32->10)
+```
+- Row-wise patch embedding (each 28-pixel row is a patch)
+- Trained on MNIST with Adam optimizer and softmax cross-entropy loss
+- Separate binary: `cargo run --release --bin main_vit`
 
-Both models trained for 3 epochs on the full MNIST dataset (60k train / 10k test) with learning rate 0.01 and data shuffling enabled.
+## Autograd Engine (`tensor.rs`)
+
+Tape-based reverse-mode automatic differentiation supporting:
+
+| Category | Operations |
+|----------|-----------|
+| Linear algebra | MatMul, Add, Mul, Transpose, ScalarMul |
+| Convolution | Conv2D, MaxPool2D, Flatten |
+| Activations | ReLU, Softmax |
+| Losses | MSE, Softmax + CrossEntropy |
+| Normalization | LayerNorm |
+| Attention | SliceCols, ConcatCols, MeanPool |
+| Sequence | Embedding, Positional Encoding |
+| Optimizers | SGD, Adam (with bias-corrected first/second moments) |
+
+Weight initialization uses Kaiming/He scaling with a deterministic xorshift RNG (seed=42).
+
+## MNIST Comparison Results
+
+ANN and CNN trained for 3 epochs on full MNIST (60k train / 10k test), learning rate 0.01, data shuffling enabled.
 
 | Metric              |        ANN |        CNN |
 |---------------------|------------|------------|
@@ -47,20 +78,22 @@ Both models trained for 3 epochs on the full MNIST dataset (60k train / 10k test
 
 **CNN achieves ~23% higher test accuracy with ~20x fewer parameters.**
 
-The CNN takes longer to train because it processes one image at a time (no batched convolution), but its spatial feature extraction dramatically outperforms the flat ANN.
-
 ## Project Structure
 
 ```
 rust_ann/
-├── Cargo.toml          # Zero dependencies
+├── Cargo.toml              # Zero dependencies, two binaries
 ├── src/
-│   ├── main.rs         # Training loops, comparison, shuffling
-│   ├── tensor.rs       # Autograd tape, forward/backward ops, SGD
-│   ├── layers.rs       # Linear and Conv2D layer abstractions
-│   └── mnist.rs        # MNIST binary format loader
+│   ├── lib.rs              # Crate root (re-exports modules)
+│   ├── tensor.rs           # Autograd tape, forward/backward ops, SGD, Adam
+│   ├── layers.rs           # Linear, Conv2D, Embedding, MultiHeadAttention,
+│   │                       #   LayerNorm, TransformerBlock, Transformer, VisionTransformer
+│   ├── mnist.rs            # MNIST binary format loader
+│   ├── main.rs             # ANN + CNN + Transformer training
+│   ├── main_vit.rs         # Vision Transformer training (separate binary)
+│   └── transformer_train.rs # Transformer character-prediction training loop
 └── data/
-    └── MNIST/raw/      # Dataset files (not in git, see Setup)
+    └── MNIST/raw/          # Dataset files (not in git, see Setup)
 ```
 
 ## Setup
@@ -84,7 +117,11 @@ done
 
 ### 3. Build and Run
 ```bash
+# ANN + CNN + Transformer comparison
 cargo run --release
+
+# Vision Transformer (MNIST)
+cargo run --release --bin main_vit
 ```
 
 Release mode is recommended — debug builds are significantly slower for the matrix operations.
@@ -95,19 +132,20 @@ Release mode is recommended — debug builds are significantly slower for the ma
 1. Load and normalize MNIST images to `[0.0, 1.0]`
 2. Shuffle training indices each epoch (Fisher-Yates with xorshift RNG)
 3. Forward pass through network layers
-4. Compute MSE loss against one-hot targets
+4. Compute loss (MSE for ANN/CNN, softmax cross-entropy for Transformer/ViT)
 5. Backward pass through the computation graph (reverse topological order)
-6. SGD parameter update: `param -= lr * grad`
-7. Evaluate on full test set after each epoch
+6. Parameter update via SGD or Adam
+7. Evaluate on test set after each epoch
 
 ### Autograd
 Each operation records itself on a `Tape`. During `backward()`, gradients flow in reverse through the graph using the chain rule. The tape is reset between batches/samples while preserving learned parameters via `freeze_params()`.
 
 ### Key Design Decisions
-- **MSE loss** instead of cross-entropy — simpler gradient computation, still converges well
-- **No softmax** — raw logits compared via argmax for classification
+- **MSE loss** for ANN/CNN, **softmax cross-entropy** for Transformer/ViT
 - **Deterministic RNG** (seed=42) — reproducible weight initialization across runs
 - **Tape-based autograd** — clean separation between forward computation and gradient tracking
+- **Adam optimizer** with bias-corrected moments for the ViT pipeline
+- **Row-wise patch embedding** in ViT — each image row is treated as a token
 
 ## Requirements
 

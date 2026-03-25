@@ -3,4 +3,12 @@ name = "rust_ann"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rust_ann"
+path = "src/main.rs"
+
+[[bin]]
+name = "main_vit"
+path = "src/main_vit.rs"
+
 [dependencies]

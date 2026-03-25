@@ -1,11 +1,7 @@
-mod layers;
-mod mnist;
-mod tensor;
-
-use layers::{Conv2D, Linear};
-use mnist::load_mnist;
+use rust_ann::layers::{Conv2D, Linear};
+use rust_ann::mnist::{self, load_mnist};
+use rust_ann::tensor::{sgd_step, Tape};
 use std::time::Instant;
-use tensor::{sgd_step, Tape};
 
 fn one_hot(label: u8, num_classes: usize) -> Vec<f64> {
     let mut v = vec![0.0; num_classes];
@@ -336,6 +332,9 @@ fn main() {
 
     println!();
     let cnn_result = train_cnn(&data);
+
+    println!();
+    rust_ann::transformer_train::train_transformer();
 
     println!("========================================");
     println!("  FAIR COMPARISON SUMMARY");

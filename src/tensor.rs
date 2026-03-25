@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Op {
     None,
     Add(usize, usize),
@@ -33,6 +33,56 @@ pub enum Op {
     },
     Softmax {
         input: usize,
+        cols: usize,
+    },
+    ScalarMul {
+        input: usize,
+        scalar: f64,
+    },
+    Reshape {
+        input: usize,
+    },
+    Transpose {
+        input: usize,
+        dim0: usize,
+        dim1: usize,
+    },
+
+    SoftmaxCrossEntropy {
+        input: usize,
+        target: usize,
+        cols: usize,
+    },
+
+    LayerNorm {
+        input: usize,
+        gamma: usize,
+        beta: usize,
+        cols: usize,
+        eps: f64,
+    },
+
+    Embedding {
+        table: usize,
+        indices: Vec<usize>,
+    },
+
+    SliceCols {
+        input: usize,
+        rows: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_end: usize,
+    },
+
+    ConcatCols {
+        inputs: Vec<usize>,
+        rows: usize,
+    },
+
+    MeanPool {
+        input: usize,
+        rows: usize,
         cols: usize,
     },
 }
@@ -74,11 +124,85 @@ pub fn raw_transpose(data: &[f64], rows: usize, cols: usize) -> Vec<f64> {
     transposed
 }
 
+pub fn positional_encoding(max_len: usize, d_model: usize) -> Vec<f64> {
+    let mut pe = Vec::with_capacity(max_len * d_model);
+    for pos in 0..max_len {
+        for i in 0..d_model {
+            let div_term = (10000.0_f64).powf(((i / 2) * 2) as f64 / d_model as f64);
+            let val = if i % 2 == 0 {
+                (pos as f64 / div_term).sin()
+            } else {
+                (pos as f64 / div_term).cos()
+            };
+            pe.push(val);
+        }
+    }
+    pe
+}
+
 pub fn sgd_step(tape: &mut Tape, learning_rate: f64) {
     for tensor in tape.tensors.iter_mut() {
         if tensor.requires_grad {
             for (d, g) in tensor.data.iter_mut().zip(tensor.grad.iter_mut()) {
                 *d -= learning_rate * *g;
+                *g = 0.0;
+            }
+        }
+    }
+}
+
+pub struct Adam {
+    pub lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+    pub t: usize,
+    pub m: Vec<Vec<f64>>,
+    pub v: Vec<Vec<f64>>,
+}
+
+impl Adam {
+    pub fn new(tape: &Tape, lr: f64) -> Self {
+        let mut m = Vec::new();
+        let mut v = Vec::new();
+
+        for tensor in &tape.tensors {
+            if tensor.requires_grad {
+                m.push(vec![0.0; tensor.data.len()]);
+                v.push(vec![0.0; tensor.data.len()]);
+            } else {
+                m.push(Vec::new());
+                v.push(Vec::new());
+            }
+        }
+
+        Adam {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            t: 0,
+            m,
+            v,
+        }
+    }
+
+    pub fn step(&mut self, tape: &mut Tape) {
+        self.t += 1;
+
+        for (i, tensor) in tape.tensors[..tape.param_count].iter_mut().enumerate() {
+            if !tensor.requires_grad {
+                continue;
+            }
+
+            for (j, (d, g)) in tensor.data.iter_mut().zip(tensor.grad.iter_mut()).enumerate() {
+                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * *g;
+                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * *g * *g;
+
+                let m_hat = self.m[i][j] / (1.0 - self.beta1.powi(self.t as i32));
+                let v_hat = self.v[i][j] / (1.0 - self.beta2.powi(self.t as i32));
+
+                *d -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
                 *g = 0.0;
             }
         }
@@ -560,6 +684,426 @@ impl Tape {
         self.tensors.len() - 1
     }
 
+    pub fn scalar_mul(&mut self, input_idx: usize, scalar: f64) -> usize {
+        // get input data
+        let input_data = &self.tensors[input_idx].data;
+        //mulyiple every element of scalar
+        let result_data: Vec<f64> = input_data.iter().map(|&x| x * scalar).collect();
+
+        // create tensor
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; result_data.len()]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: result_data,
+            shape: self.tensors[input_idx].shape.clone(),
+            grad,
+            requires_grad,
+            op: Op::ScalarMul {
+                input: input_idx,
+                scalar,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn reshape(&mut self, input_idx: usize, new_shape: Vec<usize>) -> usize {
+        let old_len: usize = self.tensors[input_idx].data.len();
+        let new_len: usize = new_shape.iter().product();
+        assert_eq!(old_len, new_len, "Reshape: total elemnts must match");
+
+        let data = self.tensors[input_idx].data.clone();
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; old_len]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data,
+            shape: new_shape,
+            grad,
+            requires_grad,
+            op: Op::Reshape { input: input_idx },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn transpose(&mut self, input_idx: usize, dim0: usize, dim1: usize) -> usize {
+        let old_shape = self.tensors[input_idx].shape.clone();
+        let ndim = old_shape.len();
+        assert!(dim0 < ndim && dim1 < ndim, "dims out of range");
+
+        // new shape swap dim0 and dim1
+        let mut new_shape = old_shape.clone();
+        new_shape.swap(dim0, dim1);
+
+        let total_len = old_shape.iter().product::<usize>();
+        let input_data = &self.tensors[input_idx].data;
+        let mut result_data = vec![0.0; total_len];
+
+        // for each element compute coords, swap, compute new flat index
+        for old_flat in 0..total_len {
+            // conver flat to coordinates using old_shape
+            let mut coords = vec![0usize; ndim];
+            let mut remaining = old_flat;
+            for d in 0..ndim {
+                let stride: usize = old_shape[d + 1..].iter().product();
+                coords[d] = remaining / stride;
+                remaining %= stride;
+            }
+
+            // swap coordinates
+            coords.swap(dim0, dim1);
+
+            // conver coordinates to flat using new_shape
+            let mut new_flat = 0;
+            for d in 0..ndim {
+                let stride: usize = new_shape[d + 1..].iter().product();
+                new_flat += coords[d] * stride;
+            }
+
+            result_data[new_flat] = input_data[old_flat];
+        }
+
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; total_len]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: result_data,
+            shape: new_shape,
+            grad,
+            requires_grad,
+            op: Op::Transpose {
+                input: input_idx,
+                dim0,
+                dim1,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn softmax_cross_entropy(
+        &mut self,
+        input_idx: usize,
+        target_idx: usize,
+        cols: usize,
+    ) -> usize {
+        let input_data = &self.tensors[input_idx].data;
+        let target_data = &self.tensors[target_idx].data;
+        let total_len = input_data.len();
+        let rows = total_len / cols;
+
+        // compute softmax
+        let mut softmax_out = vec![0.0; total_len];
+        for r in 0..rows {
+            let start = r * cols;
+            let row = &input_data[start..start + cols];
+
+            let max_val = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+            let mut sum = 0.0;
+            for i in 0..cols {
+                let e = (row[i] - max_val).exp();
+                softmax_out[start + i] = e;
+                sum += e;
+            }
+
+            for i in 0..cols {
+                softmax_out[start + i] /= sum;
+            }
+        }
+
+        let mut loss = 0.0; // compute cross-entropy loss
+        for i in 0..total_len {
+            loss -= target_data[i] * (softmax_out[i] + 1e-8).ln();
+        }
+        loss /= rows as f64;
+
+        // store the softmax outuput as a tensor
+        let sm_tensor = Tensor {
+            data: softmax_out,
+            shape: self.tensors[input_idx].shape.clone(),
+            grad: Vec::new(),
+            requires_grad: false,
+            op: Op::None,
+        };
+        self.tensors.push(sm_tensor);
+        let sm_idx = self.tensors.len() - 1;
+
+        // create loss tensor
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; 1]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: vec![loss],
+            shape: vec![1],
+            grad,
+            requires_grad,
+            op: Op::SoftmaxCrossEntropy {
+                input: input_idx,
+                target: target_idx,
+                cols,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn layernorm(
+        &mut self,
+        input_idx: usize,
+        gamma_idx: usize,
+        beta_idx: usize,
+        cols: usize,
+        eps: f64,
+    ) -> usize {
+        let input_data = &self.tensors[input_idx].data;
+        let gamma_data = &self.tensors[gamma_idx].data;
+        let beta_data = &self.tensors[beta_idx].data;
+        let total_len = input_data.len();
+        let rows = total_len / cols;
+
+        let mut output_data = vec![0.0; total_len];
+        let mut norm_data = vec![0.0; total_len];
+
+        for r in 0..rows {
+            let start = r * cols;
+            // calculate mean
+            let mut mean = 0.0;
+            for c in 0..cols {
+                mean += input_data[start + c];
+            }
+            mean /= cols as f64;
+
+            // calculate variance
+            let mut var = 0.0;
+            for c in 0..cols {
+                let diff = input_data[start + c] - mean;
+                var += diff * diff;
+            }
+
+            var /= cols as f64;
+
+            let inv_std = 1.0 / (var + eps).sqrt();
+
+            // normalize, scale shift
+            for c in 0..cols {
+                let norm = (input_data[start + c] - mean) * inv_std;
+                norm_data[start + c] = norm;
+                output_data[start + c] = gamma_data[c] * norm + beta_data[c];
+            }
+        }
+
+        // store norma data as a hidden tensor
+        let norm_tensor = Tensor {
+            data: norm_data,
+            shape: self.tensors[input_idx].shape.clone(),
+            grad: Vec::new(),
+            requires_grad: false,
+            op: Op::None,
+        };
+        self.tensors.push(norm_tensor);
+
+        // create output tensor
+        let requires_grad = self.tensors[input_idx].requires_grad
+            || self.tensors[gamma_idx].requires_grad
+            || self.tensors[beta_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; total_len]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: output_data,
+            shape: self.tensors[input_idx].shape.clone(),
+            grad,
+            requires_grad,
+            op: Op::LayerNorm {
+                input: input_idx,
+                gamma: gamma_idx,
+                beta: beta_idx,
+                cols,
+                eps,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn embedding(&mut self, table_idx: usize, indices: &[usize]) -> usize {
+        let table_data = &self.tensors[table_idx].data;
+        let table_shape = &self.tensors[table_idx].shape;
+        let vocab_size = table_shape[0];
+        let d_model = table_shape[1];
+        let seq_len = indices.len();
+
+        // Look up each row
+        let mut result_data = Vec::with_capacity(seq_len * d_model);
+        for &idx in indices {
+            assert!(
+                idx < vocab_size,
+                "Token index {} out of vocab range {}",
+                idx,
+                vocab_size
+            );
+            let start = idx * d_model;
+            result_data.extend_from_slice(&table_data[start..start + d_model]);
+        }
+
+        let requires_grad = self.tensors[table_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; seq_len * d_model]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: result_data,
+            shape: vec![seq_len, d_model],
+            grad,
+            requires_grad,
+            op: Op::Embedding {
+                table: table_idx,
+                indices: indices.to_vec(),
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn slice_cols(
+        &mut self,
+        input_idx: usize,
+        rows: usize,
+        total_cols: usize,
+        col_start: usize,
+        col_end: usize,
+    ) -> usize {
+        let input_data = &self.tensors[input_idx].data;
+        let slice_cols = col_end - col_start;
+        let mut result_data = Vec::with_capacity(rows * slice_cols);
+
+        for r in 0..rows {
+            for c in col_start..col_end {
+                result_data.push(input_data[r * total_cols + c]);
+            }
+        }
+
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; result_data.len()]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: result_data,
+            shape: vec![rows, slice_cols],
+            grad,
+            requires_grad,
+            op: Op::SliceCols {
+                input: input_idx,
+                rows,
+                total_cols,
+                col_start,
+                col_end,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn concat_cols(&mut self, input_indices: &[usize], rows: usize) -> usize {
+        let total_cols: usize = input_indices
+            .iter()
+            .map(|&idx| self.tensors[idx].shape[1])
+            .sum();
+
+        let mut result_data = Vec::with_capacity(rows * total_cols);
+        for r in 0..rows {
+            for &idx in input_indices {
+                let cols = self.tensors[idx].shape[1];
+                let start = r * cols;
+                result_data.extend_from_slice(&self.tensors[idx].data[start..start + cols]);
+            }
+        }
+
+        let requires_grad = input_indices
+            .iter()
+            .any(|&idx| self.tensors[idx].requires_grad);
+        let grad = if requires_grad {
+            vec![0.0; result_data.len()]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: result_data,
+            shape: vec![rows, total_cols],
+            grad,
+            requires_grad,
+            op: Op::ConcatCols {
+                inputs: input_indices.to_vec(),
+                rows,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
+    pub fn mean_pool(&mut self, input_idx: usize, rows: usize, cols: usize) -> usize {
+        let input_data = &self.tensors[input_idx].data;
+        let mut result_data = vec![0.0; cols];
+
+        for r in 0..rows {
+            for c in 0..cols {
+                result_data[c] += input_data[r * cols + c];
+            }
+        }
+        for c in 0..cols {
+            result_data[c] /= rows as f64;
+        }
+
+        let requires_grad = self.tensors[input_idx].requires_grad;
+        let grad = if requires_grad {
+            vec![0.0; cols]
+        } else {
+            Vec::new()
+        };
+
+        let result_tensor = Tensor {
+            data: result_data,
+            shape: vec![1, cols],
+            grad,
+            requires_grad,
+            op: Op::MeanPool {
+                input: input_idx,
+                rows,
+                cols,
+            },
+        };
+        self.tensors.push(result_tensor);
+        self.tensors.len() - 1
+    }
+
     pub fn backward(&mut self, output: usize) {
         if self.tensors[output].requires_grad {
             let len = self.tensors[output].data.len();
@@ -571,7 +1115,7 @@ impl Tape {
         for i in (0..=output).rev() {
             let (op, grad_current, _data_current) = {
                 let t = &self.tensors[i];
-                (t.op, t.grad.clone(), t.data.clone())
+                (t.op.clone(), t.grad.clone(), t.data.clone())
             };
 
             match op {
@@ -879,7 +1423,218 @@ impl Tape {
                     }
                 }
 
+                Op::ScalarMul { input, scalar } => {
+                    if self.tensors[input].requires_grad {
+                        for (i, g) in grad_current.iter().enumerate() {
+                            self.tensors[input].grad[i] += g * scalar;
+                        }
+                    }
+                }
 
+                Op::Reshape { input } => {
+                    if self.tensors[input].requires_grad {
+                        for (i, g) in grad_current.iter().enumerate() {
+                            self.tensors[input].grad[i] += g;
+                        }
+                    }
+                }
+
+                Op::Transpose { input, dim0, dim1 } => {
+                    if self.tensors[input].requires_grad {
+                        let old_shape = self.tensors[input].shape.clone();
+                        let ndim = old_shape.len();
+
+                        // current tensor already swap
+                        // need to untranspose it the gradient back
+                        let mut swapped_shape = old_shape.clone();
+                        swapped_shape.swap(dim0, dim1);
+
+                        let total_len = grad_current.len();
+
+                        for swapped_flat in 0..total_len {
+                            // conver flat to coords using swapped_shape
+                            let mut coords = vec![0usize; ndim];
+                            let mut remaining = swapped_flat;
+                            for d in 0..ndim {
+                                let stride: usize = swapped_shape[d + 1..].iter().product();
+                                coords[d] = remaining / stride;
+                                remaining %= stride;
+                            }
+
+                            // swap back
+                            coords.swap(dim0, dim1);
+                            let mut orig_flat = 0;
+                            for d in 0..ndim {
+                                let stride: usize = old_shape[d + 1..].iter().product();
+                                orig_flat += coords[d] * stride;
+                            }
+
+                            self.tensors[input].grad[orig_flat] += grad_current[swapped_flat];
+                        }
+                    }
+                }
+
+                Op::SoftmaxCrossEntropy {
+                    input,
+                    target,
+                    cols,
+                } => {
+                    if self.tensors[input].requires_grad {
+                        // softmax output is stored at index [i - 1]
+                        // because pushed it right before the loss tensor
+                        let sm_data = self.tensors[i - 1].data.clone();
+                        let target_data = self.tensors[target].data.clone();
+                        let rows = sm_data.len() / cols;
+                        let upstream = grad_current[0];
+
+                        for j in 0..sm_data.len() {
+                            self.tensors[input].grad[j] +=
+                                upstream * (sm_data[j] - target_data[j]) / rows as f64;
+                        }
+                    }
+                }
+
+                Op::LayerNorm {
+                    input,
+                    gamma,
+                    beta,
+                    cols,
+                    eps,
+                } => {
+                    let input_data = self.tensors[input].data.clone();
+                    let gamma_data = self.tensors[gamma].data.clone();
+                    let norm_data = self.tensors[i - 1].data.clone(); // hidden tensor
+                    let req_input = self.tensors[input].requires_grad;
+                    let req_gamma = self.tensors[gamma].requires_grad;
+                    let req_beta = self.tensors[beta].requires_grad;
+                    let total_len = input_data.len();
+                    let rows = total_len / cols;
+
+                    // dL/d_gamma
+                    if req_gamma {
+                        for r in 0..rows {
+                            let start = r * cols;
+                            for c in 0..cols {
+                                self.tensors[gamma].grad[c] +=
+                                    grad_current[start + c] * norm_data[start + c];
+                            }
+                        }
+                    }
+
+                    // dL/d_beta
+                    if req_beta {
+                        for r in 0..rows {
+                            let start = r * cols;
+                            for c in 0..cols {
+                                self.tensors[beta].grad[c] += grad_current[start + c];
+                            }
+                        }
+                    }
+
+                    // dL/d_x
+                    if req_input {
+                        for r in 0..rows {
+                            let start = r * cols;
+                            // compute mean and variance again :)
+                            let mut mean = 0.0;
+                            for c in 0..cols {
+                                mean += input_data[start + c];
+                            }
+                            mean /= cols as f64;
+
+                            let mut var = 0.0;
+                            for c in 0..cols {
+                                let diff = input_data[start + c] - mean;
+                                var += diff * diff;
+                            }
+                            var /= cols as f64;
+
+                            let inv_std = 1.0 / (var + eps).sqrt();
+
+                            // Hard compute stuff
+                            let mut mean_dy_dnorm = 0.0;
+                            let mut mean_dy_dnorm_norm = 0.0;
+                            for c in 0..cols {
+                                let dy_dnorm = grad_current[start + c] * gamma_data[c];
+                                mean_dy_dnorm += dy_dnorm;
+                                mean_dy_dnorm_norm += dy_dnorm * norm_data[start + c];
+                            }
+
+                            mean_dy_dnorm /= cols as f64;
+                            mean_dy_dnorm_norm /= cols as f64;
+
+                            // final gradient input
+                            for c in 0..cols {
+                                let dy_dnorm = grad_current[start + c] * gamma_data[c];
+                                self.tensors[input].grad[start + c] += inv_std
+                                    * (dy_dnorm
+                                        - mean_dy_dnorm
+                                        - norm_data[start + c] * mean_dy_dnorm_norm);
+                            }
+                        }
+                    }
+                }
+
+                Op::Embedding { table, ref indices } => {
+                    if self.tensors[table].requires_grad {
+                        let d_model = self.tensors[table].shape[1];
+                        for (i, &idx) in indices.iter().enumerate() {
+                            let grad_start = i * d_model;
+                            let table_start = idx * d_model;
+                            for d in 0..d_model {
+                                self.tensors[table].grad[table_start + d] +=
+                                    grad_current[grad_start + d];
+                            }
+                        }
+                    }
+                }
+
+                Op::SliceCols {
+                    input,
+                    rows,
+                    total_cols,
+                    col_start,
+                    col_end,
+                } => {
+                    if self.tensors[input].requires_grad {
+                        let slice_cols = col_end - col_start;
+                        for r in 0..rows {
+                            for c in 0..slice_cols {
+                                self.tensors[input].grad[r * total_cols + col_start + c] +=
+                                    grad_current[r * slice_cols + c];
+                            }
+                        }
+                    }
+                }
+
+                Op::ConcatCols { ref inputs, rows } => {
+                    let total_cols: usize =
+                        inputs.iter().map(|&idx| self.tensors[idx].shape[1]).sum();
+                    let mut col_offset = 0;
+                    for &idx in inputs.iter() {
+                        let cols = self.tensors[idx].shape[1];
+                        if self.tensors[idx].requires_grad {
+                            for r in 0..rows {
+                                for c in 0..cols {
+                                    self.tensors[idx].grad[r * cols + c] +=
+                                        grad_current[r * total_cols + col_offset + c];
+                                }
+                            }
+                        }
+                        col_offset += cols;
+                    }
+                }
+
+                Op::MeanPool { input, rows, cols } => {
+                    if self.tensors[input].requires_grad {
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                self.tensors[input].grad[r * cols + c] +=
+                                    grad_current[c] / rows as f64;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
