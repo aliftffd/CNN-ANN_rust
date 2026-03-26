@@ -3,12 +3,24 @@ name = "rust_ann"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "rust_ann"
-path = "src/main.rs"
+[[example]]
+name = "xor"
+path = "examples/xor.rs"
 
-[[bin]]
-name = "main_vit"
-path = "src/main_vit.rs"
+[[example]]
+name = "mnist_ann"
+path = "examples/mnist_ann.rs"
+
+[[example]]
+name = "mnist_cnn"
+path = "examples/mnist_cnn.rs"
+
+[[example]]
+name = "mnist_vit"
+path = "examples/mnist_vit.rs"
+
+[[example]]
+name = "char_transformer"
+path = "examples/char_transformer.rs"
 
 [dependencies]
