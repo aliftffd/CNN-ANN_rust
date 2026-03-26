@@ -23,4 +23,12 @@ path = "examples/mnist_vit.rs"
 name = "char_transformer"
 path = "examples/char_transformer.rs"
 
+[[example]]
+name = "gpt_char"
+path = "examples/gpt_char.rs"
+
+[[example]]
+name = "gpt_shakespeare"
+path = "examples/gpt_shakespeare.rs"
+
 [dependencies]

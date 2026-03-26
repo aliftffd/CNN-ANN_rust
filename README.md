@@ -6,6 +6,16 @@ A from-scratch deep learning framework in pure Rust — **zero external dependen
 
 Most ML frameworks are Python + C++. This project proves you can build a working autograd engine, convolutional layers, multi-head attention, layer normalization, and full training loops in pure Rust with nothing but `std`.
 
+## Results
+
+| Model | Parameters | Test Accuracy | Training Time | Optimizer |
+|-------|-----------|---------------|---------------|-----------|
+| ANN   | 101,770   | ~90%          | 45s           | SGD       |
+| CNN   | 5,226     | ~90%          | 17s           | SGD       |
+| ViT   | 18,346    | 88.7%         | 410s          | Adam      |
+
+All models trained on MNIST (60k train / 10k test), 3 epochs, pure CPU.
+
 ## Quick Start
 
 ```bash
@@ -25,7 +35,7 @@ cargo run --release --example xor
 ```
 Input(784) -> Linear(128) -> ReLU -> Linear(10) -> MSE Loss
 ```
-101,770 parameters | Batched (32) | **~73% test accuracy**
+101,770 parameters | Batched (32) | SGD
 
 ### CNN — Convolutional Network
 ```
@@ -33,7 +43,7 @@ Input(1x28x28) -> Conv2D(1->8,3x3) -> ReLU -> MaxPool(2x2)
               -> Conv2D(8->16,3x3) -> ReLU -> MaxPool(2x2)
               -> Flatten(400) -> Linear(10) -> MSE Loss
 ```
-5,226 parameters | Single-image | **~97% test accuracy**
+5,226 parameters | Single-image | SGD
 
 ### Transformer — Character Prediction
 ```
@@ -46,6 +56,13 @@ Learns to predict next character in a repeating `abcdef` pattern with autoregres
 Image[28,28] -> Linear(28->32) -> +PosEnc -> TransformerBlock x2 -> MeanPool -> Linear(32->10)
 ```
 Row-wise patch embedding | Adam optimizer | Softmax cross-entropy loss
+
+## Key Insights
+
+- SGD completely fails on Transformers (12% → stuck). Adam was essential (→ 89%)
+- Dying ReLU: random weight init caused all-negative pre-activations, blocking all gradients
+- Rust's borrow checker forced a tape-based autograd design — can't store parent references
+- Cache-friendly loop ordering in matmul: reordering i,j,k → i,k,j gives 3-5x speedup
 
 ## Project Structure
 
@@ -119,6 +136,11 @@ Release mode is recommended — debug builds are significantly slower for the ma
 - **[Architecture](docs/architecture.md)** — How the autograd tape, backward pass, and optimizers work
 - **[Benchmarks](docs/benchmarks.md)** — ANN vs CNN vs Transformer vs ViT comparison results
 - **[CUDA Roadmap](docs/cuda_roadmap.md)** — Plan for GPU acceleration via cudarc/cuBLAS/cuDNN
+
+## Tested On
+
+- Ryzen 9 5900HX, RTX 3050 Laptop (4GB), 16 threads
+- Arch Linux
 
 ## Requirements
 

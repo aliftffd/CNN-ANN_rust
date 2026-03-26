@@ -195,7 +195,12 @@ impl Adam {
                 continue;
             }
 
-            for (j, (d, g)) in tensor.data.iter_mut().zip(tensor.grad.iter_mut()).enumerate() {
+            for (j, (d, g)) in tensor
+                .data
+                .iter_mut()
+                .zip(tensor.grad.iter_mut())
+                .enumerate()
+            {
                 self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * *g;
                 self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * *g * *g;
 

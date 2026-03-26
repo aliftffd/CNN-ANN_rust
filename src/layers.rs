@@ -26,8 +26,7 @@ impl Linear {
 
     pub fn forward(&self, tape: &mut Tape, input: usize) -> usize {
         let z = tape.matmul(input, self.weights);
-        let out = tape.add_broadcast(z, self.bias);
-        out
+        tape.add_broadcast(z, self.bias)
     }
 }
 
@@ -143,7 +142,13 @@ impl MultiHeadAttention {
         }
     }
 
-    pub fn forward(&self, tape: &mut Tape, input: usize, seq_len: usize) -> usize {
+    pub fn forward(
+        &self,
+        tape: &mut Tape,
+        input: usize,
+        seq_len: usize,
+        mask: Option<usize>,
+    ) -> usize {
         // 1. Project
         let q = self.w_q.forward(tape, input);
         let k = self.w_k.forward(tape, input);
@@ -159,7 +164,7 @@ impl MultiHeadAttention {
             let k_h = tape.slice_cols(k, seq_len, self.d_model, col_start, col_end);
             let v_h = tape.slice_cols(v, seq_len, self.d_model, col_start, col_end);
 
-            let attn_h = scaled_dot_product_attention(tape, q_h, k_h, v_h, self.d_k);
+            let attn_h = scaled_dot_product_attention(tape, q_h, k_h, v_h, self.d_k, mask);
             head_outputs.push(attn_h);
         }
 
@@ -222,13 +227,17 @@ impl TransformerBlock {
         }
     }
 
-    pub fn forward(&self, tape: &mut Tape, input: usize, seq_len: usize) -> usize {
-        // Multi-head attention + residual + layernorm
-        let attn_out = self.mha.forward(tape, input, seq_len);
+    pub fn forward(
+        &self,
+        tape: &mut Tape,
+        input: usize,
+        seq_len: usize,
+        mask: Option<usize>,
+    ) -> usize {
+        let attn_out = self.mha.forward(tape, input, seq_len, mask);
         let residual1 = tape.add(input, attn_out);
         let norm1_out = self.norm1.forward(tape, residual1);
 
-        // FFN + residual + layernorm
         let ff_hidden = self.ff1.forward(tape, norm1_out);
         let ff_relu = tape.relu(ff_hidden);
         let ff_out = self.ff2.forward(tape, ff_relu);
@@ -290,9 +299,9 @@ impl Transformer {
         let pe = tape.add_tensor(pe_data, vec![seq_len, self.d_model], false);
         let mut x = tape.add(embedded, pe);
 
-        // 3. Pass through each transformer block
+        // 3. Pass through each transformer block (encoder — no mask)
         for block in &self.blocks {
-            x = block.forward(tape, x, seq_len);
+            x = block.forward(tape, x, seq_len, None);
         }
 
         // 4. Output projection → [seq_len, vocab_size]
@@ -353,7 +362,7 @@ impl VisionTransformer {
         let mut h = tape.add(projected, pe);
 
         for block in &self.block {
-            h = block.forward(tape, h, self.seq_len);
+            h = block.forward(tape, h, self.seq_len, None);
         }
 
         let pooled = tape.mean_pool(h, self.seq_len, self.d_model);
@@ -368,12 +377,101 @@ pub fn scaled_dot_product_attention(
     k: usize,
     v: usize,
     d_k: usize,
+    mask: Option<usize>,
 ) -> usize {
     let k_t = tape.transpose(k, 0, 1);
     let scores = tape.matmul(q, k_t);
     let scale = 1.0 / (d_k as f64).sqrt();
     let scaled = tape.scalar_mul(scores, scale);
+
+    let masked = match mask {
+        Some(mask_idx) => tape.add(scaled, mask_idx),
+        None => scaled,
+    };
+
     let seq_len = tape.tensors[q].shape[0];
-    let weights = tape.softmax(scaled, seq_len);
+    let weights = tape.softmax(masked, seq_len);
     tape.matmul(weights, v)
+}
+
+/// Generates a causal (lower-triangular) mask for autoregressive attention.
+/// Future positions get -1e9 (effectively -inf after softmax), past/current get 0.
+pub fn causal_mask(seq_len: usize) -> Vec<f64> {
+    let mut mask = vec![0.0; seq_len * seq_len];
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j > i {
+                mask[i * seq_len + j] = -1e9;
+            }
+        }
+    }
+    mask
+}
+
+pub struct GPT {
+    pub embedding: Embedding,
+    pub blocks: Vec<TransformerBlock>,
+    pub output_proj: Linear,
+    pub d_model: usize,
+    pub max_seq_len: usize,
+    pub pe_idx: usize,
+    pub vocab_size: usize,
+}
+
+impl GPT {
+    pub fn new(
+        tape: &mut Tape,
+        vocab_size: usize,
+        d_model: usize,
+        n_heads: usize,
+        d_ff: usize,
+        n_layers: usize,
+        max_seq_len: usize,
+        seed: &mut u64,
+    ) -> Self {
+        let embedding = Embedding::new(tape, vocab_size, d_model, seed);
+        let pe_data = positional_encoding(max_seq_len, d_model);
+        let pe_idx = tape.add_tensor(pe_data, vec![max_seq_len, d_model], false);
+
+        let mut blocks = Vec::new();
+        for _ in 0..n_layers {
+            blocks.push(TransformerBlock::new(tape, d_model, n_heads, d_ff, seed));
+        }
+
+        let output_proj = Linear::new(tape, d_model, vocab_size, seed);
+
+        GPT {
+            embedding,
+            blocks,
+            output_proj,
+            d_model,
+            max_seq_len,
+            pe_idx,
+            vocab_size,
+        }
+    }
+
+    pub fn forward(&self, tape: &mut Tape, tokens: &[usize]) -> usize {
+        let seq_len = tokens.len();
+
+        // 1. Embed tokens
+        let embedded = self.embedding.forward(tape, tokens);
+
+        // 2. Add positional encoding
+        let pe_data = tape.tensors[self.pe_idx].data[..seq_len * self.d_model].to_vec();
+        let pe = tape.add_tensor(pe_data, vec![seq_len, self.d_model], false);
+        let mut x = tape.add(embedded, pe);
+
+        // 3. Create causal mask and add to tape
+        let mask_data = causal_mask(seq_len);
+        let mask = tape.add_tensor(mask_data, vec![seq_len, seq_len], false);
+
+        // 4. Pass through decoder blocks WITH mask
+        for block in &self.blocks {
+            x = block.forward(tape, x, seq_len, Some(mask));
+        }
+
+        // 5. Project to vocab
+        self.output_proj.forward(tape, x)
+    }
 }
