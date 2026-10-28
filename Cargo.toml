@@ -31,4 +31,8 @@ path = "examples/gpt_char.rs"
 name = "gpt_shakespeare"
 path = "examples/gpt_shakespeare.rs"
 
+[[example]]
+name = "text_classify"
+path = "examples/text_classify.rs"
+
 [dependencies]

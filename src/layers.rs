@@ -1,4 +1,4 @@
-use crate::tensor::{positional_encoding, Tape};
+use crate::tensor::{positional_encoding, Adam, Tape};
 
 fn xorshift(seed: &mut u64) -> f64 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -473,5 +473,162 @@ impl GPT {
 
         // 5. Project to vocab
         self.output_proj.forward(tape, x)
+    }
+}
+
+// ponytail: one tape per model; batch on one tape, Adam step per batch, not per example.
+/// Bag-of-n-grams MLP for text classification:
+/// ids -> Embedding -> MeanPool -> Linear -> ReLU -> Linear(n_classes).
+pub struct TextMlp {
+    pub emb: Embedding,
+    pub hidden: Linear,
+    pub out: Linear,
+    pub n_classes: usize,
+}
+
+impl TextMlp {
+    pub fn new(
+        tape: &mut Tape,
+        buckets: usize,
+        dim: usize,
+        hidden: usize,
+        n_classes: usize,
+        seed: &mut u64,
+    ) -> Self {
+        TextMlp {
+            emb: Embedding::new(tape, buckets, dim, seed),
+            hidden: Linear::new(tape, dim, hidden, seed),
+            out: Linear::new(tape, hidden, n_classes, seed),
+            n_classes,
+        }
+    }
+
+    /// Returns logits with shape [1, n_classes].
+    pub fn forward(&self, tape: &mut Tape, ids: &[usize]) -> usize {
+        let embedded = self.emb.forward(tape, ids);
+        let pooled = tape.mean_pool(embedded, ids.len(), self.emb.d_model);
+        let h = self.hidden.forward(tape, pooled);
+        let h = tape.relu(h);
+        self.out.forward(tape, h)
+    }
+
+    /// One Adam step on the mean cross-entropy of `batch`; returns that loss.
+    pub fn train_batch(&self, tape: &mut Tape, adam: &mut Adam, batch: &[(Vec<usize>, usize)]) -> f64 {
+        let mut total: Option<usize> = None;
+        for (ids, label) in batch {
+            let logits = self.forward(tape, ids);
+            let mut one_hot = vec![0.0; self.n_classes];
+            one_hot[*label] = 1.0;
+            let target = tape.add_tensor(one_hot, vec![1, self.n_classes], false);
+            let loss = tape.softmax_cross_entropy(logits, target, self.n_classes);
+            total = Some(match total {
+                None => loss,
+                Some(acc) => tape.add(acc, loss),
+            });
+        }
+        let total = total.expect("train_batch needs at least one example");
+        let mean = tape.scalar_mul(total, 1.0 / batch.len() as f64);
+        let loss = tape.tensors[mean].data[0];
+        tape.backward(mean);
+        adam.step(tape);
+        tape.reset();
+        loss
+    }
+
+    /// Class probabilities; resets the tape so repeated calls don't grow it.
+    pub fn predict(&self, tape: &mut Tape, ids: &[usize]) -> Vec<f64> {
+        let logits = self.forward(tape, ids);
+        let probs = tape.softmax(logits, self.n_classes);
+        let out = tape.tensors[probs].data.clone();
+        tape.reset();
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::Adam;
+    use crate::text::hashed_ngrams;
+
+    const B: usize = 4096;
+
+    fn model() -> (Tape, TextMlp) {
+        let mut t = Tape::new();
+        let mut s = 42;
+        let m = TextMlp::new(&mut t, B, 16, 16, 2, &mut s);
+        t.freeze_params();
+        (t, m)
+    }
+
+    fn argmax(p: &[f64]) -> usize {
+        (0..p.len()).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap()
+    }
+
+    #[test]
+    fn learns_toy_mixed_language_data() {
+        let data = [
+            ("rapat tim besok jam 9", 0),
+            ("meeting agenda for sprint review", 0),
+            ("beli telur dan susu", 1),
+            ("grocery list milk eggs bread", 1),
+        ];
+        let batch: Vec<_> = data.iter().map(|(t, y)| (hashed_ngrams(t, B), *y)).collect();
+        let (mut t, m) = model();
+        let mut adam = Adam::new(&t, 0.01);
+        let first = m.train_batch(&mut t, &mut adam, &batch);
+        let mut last = first;
+        for _ in 0..200 {
+            last = m.train_batch(&mut t, &mut adam, &batch);
+        }
+        assert!(last < first * 0.1, "{first} -> {last}");
+        for (ids, y) in &batch {
+            assert_eq!(argmax(&m.predict(&mut t, ids)), *y);
+        }
+    }
+
+    #[test]
+    fn predict_does_not_grow_tape() {
+        let (mut t, m) = model();
+        let ids = hashed_ngrams("catatan", B);
+        for _ in 0..3 {
+            m.predict(&mut t, &ids);
+        }
+        assert_eq!(t.tensors.len(), t.param_count);
+    }
+
+    #[test]
+    fn predict_on_empty_text_is_finite() {
+        let (mut t, m) = model();
+        let p = m.predict(&mut t, &hashed_ngrams("", B));
+        assert!(p.iter().all(|x| x.is_finite()) && (p.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gradcheck_embedding_row() {
+        let (mut t, m) = model();
+        let ids = hashed_ngrams("halo", B);
+        let loss = |t: &mut Tape| {
+            let logits = m.forward(t, &ids);
+            let target = t.add_tensor(vec![0.0, 1.0], vec![1, 2], false);
+            t.softmax_cross_entropy(logits, target, 2)
+        };
+        let o = loss(&mut t);
+        t.backward(o);
+        let k = ids[0] * 16;
+        let analytic = t.tensors[m.emb.table].grad[k];
+        t.reset();
+
+        let eps = 1e-5;
+        t.tensors[m.emb.table].data[k] += eps;
+        let o = loss(&mut t);
+        let up = t.tensors[o].data[0];
+        t.reset();
+        t.tensors[m.emb.table].data[k] -= 2.0 * eps;
+        let o = loss(&mut t);
+        let down = t.tensors[o].data[0];
+        t.reset();
+
+        assert!((analytic - (up - down) / (2.0 * eps)).abs() < 1e-6, "{analytic}");
     }
 }

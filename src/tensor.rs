@@ -1118,9 +1118,19 @@ impl Tape {
         }
 
         for i in (0..=output).rev() {
+            // leaves have no parents to propagate to; skip cloning their (possibly huge) buffers
+            if matches!(self.tensors[i].op, Op::None) {
+                continue;
+            }
             let (op, grad_current, _data_current) = {
                 let t = &self.tensors[i];
-                (t.op.clone(), t.grad.clone(), t.data.clone())
+                // only Softmax's backward reads its own output data
+                let data = if matches!(t.op, Op::Softmax { .. }) {
+                    t.data.clone()
+                } else {
+                    Vec::new()
+                };
+                (t.op.clone(), t.grad.clone(), data)
             };
 
             match op {
@@ -1642,5 +1652,154 @@ impl Tape {
                 }
             }
         }
+    }
+}
+
+const PARAM_MAGIC: &[u8; 4] = b"RANN";
+const PARAM_VERSION: u32 = 1;
+
+fn take<'a>(rest: &mut &'a [u8], n: usize) -> std::io::Result<&'a [u8]> {
+    if rest.len() < n {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "parameter file is truncated",
+        ));
+    }
+    let (head, tail) = rest.split_at(n);
+    *rest = tail;
+    Ok(head)
+}
+
+fn take_u32(rest: &mut &[u8]) -> std::io::Result<u32> {
+    Ok(u32::from_le_bytes(take(rest, 4)?.try_into().unwrap()))
+}
+
+fn take_u64(rest: &mut &[u8]) -> std::io::Result<u64> {
+    Ok(u64::from_le_bytes(take(rest, 8)?.try_into().unwrap()))
+}
+
+impl Tape {
+    fn saved_param_indices(&self) -> Vec<usize> {
+        (0..self.param_count)
+            .filter(|&i| self.tensors[i].requires_grad)
+            .collect()
+    }
+
+    /// Writes every trainable parameter (shape + data, little-endian) so a tape
+    /// built with the same architecture can `load_params` it back.
+    pub fn save_params(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let indices = self.saved_param_indices();
+        w.write_all(PARAM_MAGIC)?;
+        w.write_all(&PARAM_VERSION.to_le_bytes())?;
+        w.write_all(&(indices.len() as u32).to_le_bytes())?;
+        for i in indices {
+            let t = &self.tensors[i];
+            w.write_all(&(t.shape.len() as u32).to_le_bytes())?;
+            for &d in &t.shape {
+                w.write_all(&(d as u64).to_le_bytes())?;
+            }
+            for &x in &t.data {
+                w.write_all(&x.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the whole file against this tape's parameters before writing
+    /// anything, so a bad file never leaves the model half-loaded.
+    pub fn load_params(&mut self, r: &mut impl std::io::Read) -> std::io::Result<()> {
+        let bad = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf)?;
+        let mut rest = buf.as_slice();
+
+        if take(&mut rest, 4)? != PARAM_MAGIC {
+            return Err(bad("not a rust_ann parameter file"));
+        }
+        if take_u32(&mut rest)? != PARAM_VERSION {
+            return Err(bad("unsupported parameter file version"));
+        }
+        let indices = self.saved_param_indices();
+        if take_u32(&mut rest)? as usize != indices.len() {
+            return Err(bad("parameter count does not match this model"));
+        }
+
+        let mut loaded = Vec::with_capacity(indices.len());
+        for &i in &indices {
+            let shape = &self.tensors[i].shape;
+            if take_u32(&mut rest)? as usize != shape.len() {
+                return Err(bad("parameter shape does not match this model"));
+            }
+            for &d in shape {
+                if take_u64(&mut rest)? != d as u64 {
+                    return Err(bad("parameter shape does not match this model"));
+                }
+            }
+            let len = self.tensors[i].data.len();
+            let data = take(&mut rest, len * 8)?
+                .chunks_exact(8)
+                .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<f64>>();
+            loaded.push(data);
+        }
+        if !rest.is_empty() {
+            return Err(bad("trailing bytes after parameters"));
+        }
+
+        for (i, data) in indices.into_iter().zip(loaded) {
+            self.tensors[i].data = data;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::Linear;
+
+    fn tape_with(i: usize, o: usize, seed: u64) -> Tape {
+        let mut t = Tape::new();
+        let mut s = seed;
+        Linear::new(&mut t, i, o, &mut s);
+        t.freeze_params();
+        t
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let a = tape_with(3, 2, 1);
+        let mut buf = Vec::new();
+        a.save_params(&mut buf).unwrap();
+        assert_eq!(&buf[..4], b"RANN");
+        let mut b = tape_with(3, 2, 99);
+        b.load_params(&mut buf.as_slice()).unwrap();
+        for k in 0..a.param_count {
+            assert_eq!(a.tensors[k].data, b.tensors[k].data);
+        }
+    }
+
+    #[test]
+    fn load_rejects_mismatch_and_truncation() {
+        let a = tape_with(3, 2, 1);
+        let mut buf = Vec::new();
+        a.save_params(&mut buf).unwrap();
+
+        let mut other = tape_with(4, 2, 7);
+        let before = other.tensors[0].data.clone();
+        assert_eq!(
+            other.load_params(&mut buf.as_slice()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(other.tensors[0].data, before);
+
+        let mut same = tape_with(3, 2, 7);
+        let before = same.tensors[0].data.clone();
+        assert!(same.load_params(&mut &buf[..buf.len() - 1]).is_err());
+        assert!(same.load_params(&mut &b"NOPE"[..]).is_err());
+        let mut extra = buf.clone();
+        extra.push(0);
+        assert!(same.load_params(&mut extra.as_slice()).is_err());
+        assert_eq!(same.tensors[0].data, before);
     }
 }

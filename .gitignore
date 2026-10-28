@@ -3,3 +3,6 @@
 
 # MNIST dataset (64MB binary files - download separately)
 data/
+
+# superpowers plans (local only)
+docs/superpowers/

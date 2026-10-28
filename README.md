@@ -57,6 +57,20 @@ Image[28,28] -> Linear(28->32) -> +PosEnc -> TransformerBlock x2 -> MeanPool -> 
 ```
 Row-wise patch embedding | Adam optimizer | Softmax cross-entropy loss
 
+### Text classification
+
+```
+ids = hashed_ngrams(text) -> Embedding(65536,32) -> MeanPool -> Linear(32) -> ReLU -> Linear(n_classes) -> Softmax+CE
+```
+
+Classifies 24 short Indonesian/English notes, including code-switching, as `kerja` (work), `belanja` (shopping), or `kuliah` (study). Trains on 18 notes and holds out six for testing, using Adam (lr 0.01), batch size 8, and 30 epochs.
+
+```bash
+cargo run --release --example text_classify
+```
+
+Prints each epoch's loss, test accuracy, and wall time. Saves weights to `target/text_mlp.bin`, reloads them into a fresh tape, and asserts identical prediction probabilities on all six test notes. This tiny dataset is a demonstration, not a general accuracy benchmark.
+
 ## Key Insights
 
 - SGD completely fails on Transformers (12% → stuck). Adam was essential (→ 89%)
@@ -79,14 +93,16 @@ rust_ann/
 │   ├── lib.rs                  # Crate root
 │   ├── tensor.rs               # Autograd tape, forward/backward ops, SGD, Adam
 │   ├── layers.rs               # Linear, Conv2D, Embedding, MHA, LayerNorm,
-│   │                           #   TransformerBlock, Transformer, VisionTransformer
+│   │                           #   TransformerBlock, Transformer, VisionTransformer, TextMlp
+│   ├── text.rs                 # Stable hashed character n-gram features
 │   └── mnist.rs                # MNIST binary format loader
 ├── examples/
 │   ├── xor.rs                  # Simplest demo — learn XOR gate
 │   ├── mnist_ann.rs            # Fully connected ANN on MNIST
 │   ├── mnist_cnn.rs            # CNN on MNIST
 │   ├── mnist_vit.rs            # Vision Transformer on MNIST
-│   └── char_transformer.rs     # Transformer character prediction
+│   ├── char_transformer.rs     # Transformer character prediction
+│   └── text_classify.rs        # Mixed-language note classification, save/load
 └── assets/
     └── (training curves, diagrams)
 ```
